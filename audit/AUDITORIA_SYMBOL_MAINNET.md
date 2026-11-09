@@ -4,9 +4,15 @@ Fecha del anclaje live: **2026-11-09**
 Alcance: nodo/consenso/p2p (`client/catapult`), REST, catbuffer, SDKs, bridge y tooling de la Symbol Foundation.
 
 **Veredicto: no hay crítico live que cumpla los 4 criterios en el nodo/consenso de Symbol.**
-Sí hay un **defecto crítico real en el código del bridge** (`symbol/product`), reproducible contra el clon,
-pero **no explotable live hoy**: la única instancia desplegada y accesible es testnet (Symbol testnet + Sepolia),
-sin TVL de terceros. Detalle y condición que lo convertiría en crítico live en §6.
+Sí hay **dos defectos reales en el código del bridge** (`symbol/product`), ambos reproducidos contra el clon:
+
+* **H‑1** (§6): el parser de depósitos Ethereum no valida el selector ERC‑20 ⇒ `approve(bridge, X)` cuenta como
+  depósito de X (PoC: 1e27 unidades con 1000 approvals).
+* **H‑2** (§7): una transferencia con `message` no‑UTF‑8 mata el downloader (DoS permissionless de 1 tx) y, con el
+  *scheduling* del README, el `reset()` del checkpoint re‑inserta depósitos ya pagados ⇒ pago repetido del escrow.
+
+Ninguno es explotable **live** hoy: la única instancia desplegada y accesible es testnet (Symbol testnet + Sepolia),
+sin TVL de terceros. Condición que los convertiría en críticos live en §6.3 y §7.1‑7.2.
 
 ---
 
@@ -159,9 +165,12 @@ impide el claim (no es una lista de keywords: es el descarte de cada hipótesis)
 | 6 | **Multisig**: robar cuentas multisig | `plugins/txes/multisig/src/validators/*`, `plugins/txes/aggregate/src/validators/Basic|StrictAggregateCosignaturesValidator.cpp` | `enableStrictCosignatureCheck = false` está live, pero ese check es anti‑griefing (rechaza cosignatarios inútiles), no de autorización; la autorización sigue siendo `minApproval` cosignaturas de cosignatarios en el cache. No encontré path de conteo duplicado (el `ArrayPointerFlagMap` deduplica y rechaza duplicados en basic). |
 | 7 | **Malleabilidad v3** (nuevo código de 1.0.3.9) | `AggregateTransactionPlugins` v3 buffer | El buffer cubre `Version/Network/Type/TransactionsHash/PayloadSize` y los pubkeys de cosignatarios van en `merkleSupplementaryBuffers`; `Reserved1` (excluido) no se interpreta. No hay campo semántico fuera de la identidad. |
 | 8 | **Precompiles / VM / pallets / CosmWasm / SVM** | — | No existen en Symbol: no hay VM on‑chain ni contratos. Los "program ids"/módulos son plugins nativos del nodo, ya cubiertos arriba. |
-| 9 | **Bridge** (escrow de terceros) | `product/bridge` | **Bug real** (§6), pero **no live en mainnet**: ver §6.3. |
+| 9 | **Bridge** (escrow de terceros) | `product/bridge` | **Bugs reales** (§6 H‑1, §7 H‑2), pero **no live en mainnet**: ver §6.3. |
+| 10 | **Bloque inválido gratis / overdraw dentro de una tx**: la fee se debita *después* de las notificaciones custom (`shouldApplyFeeDebitLast`, fork `treasuryReissuance`) ⇒ ¿una tx puede pasar validación gastando todo el saldo y reventar el `debit` de la fee en ejecución (bloque inválido, coste 0 para el atacante)? | `src/catapult/model/NotificationPublisher.cpp` (líneas 163‑192 y 222‑230), `src/catapult/model/NotificationPublisher`/`ProcessingNotificationSubscriber`, `plugins/coresystem/src/validators/BalanceValidator.cpp`, `src/catapult/state/AccountBalances.cpp` | **Mata:** el procesado valida y **ejecuta notificación a notificación** en la misma pasada (`chain/BatchEntityProcessor.cpp` + `chain/ProcessingNotificationSubscriber`), no "valida todo y luego ejecuta". Tras el `BalanceTransferObserver` de la transferencia (que ya debitó), la `BalanceDebitNotification` de la fee se valida contra el saldo **ya actualizado** ⇒ `Failure_Core_Insufficient_Balance` ⇒ la tx se rechaza limpiamente. `AccountBalances::debit` sí lanza `catapult_runtime_error` si falta un validador, pero cada débito (`BalanceTransfer` y `BalanceDebit`) tiene el suyo registrado (`CoreSystem.cpp` L199‑200). |
+| 11 | **Inflar/revocar XYM** (el nemesis currency) | `plugins/txes/mosaic/src/validators/*`, estado live del mosaico | **Mata:** el mosaico `0x6BED913FA20223F8` live tiene `flags = 2` (**Transferable**; sin `Supply_Mutable` ni `Revokable`), `duration = 0`, owner = dirección nemesis. Sin `Supply_Mutable` sólo podría cambiar supply si el owner tuviera el 100% (`MosaicSupplyChangeAllowed`), y sin `Revokable` `MosaicSupplyRevocation` falla siempre. No hay mint ni revoke de XYM. |
+| 12 | **Squatting de claves remotas** (`AccountKeyLink`/`VrfKeyLink`/`VotingKeyLink`): la clave remota no firma el link ⇒ cualquiera puede enlazar la clave de un tercero a su cuenta | `plugins/coresystem/src/validators/KeyLinkValidators.h`, `plugins/txes/account_link/src/*` | Es **griefing permissionless** (el dueño real ya no puede enlazar esa clave), pero no mueve valor: importance/harvest van a la cuenta que cosecha y el atacante no tiene la privada VRF ⇒ no cumple "saca más valor del que puso". |
 
-Conclusión §4: **no crítico live** en el nodo Symbol a la altura 5 936 121.
+Conclusión §4: **no crítico live** en el nodo Symbol a la altura 5 936 121 (8.57B XYM de supply, 2.7M+ XYM en sinks/tesorería medidos, todos los forks de seguridad activos).
 
 ---
 
@@ -267,7 +276,94 @@ Contramedidas que sí funcionarían pero no están: comprobar `input_data[:4] ==
 
 ---
 
-## 7. Limitaciones / lo que no se pudo cerrar
+## 7. H‑2 — Bridge `symbol/product`: crash permissionless del downloader y marcador de pago no idempotente
+
+> **Estado: alto en cualquier despliegue, NO crítico live hoy (solo testnet, misma evidencia que H‑1 §6.3).**
+> Se documenta porque es permissionless, cuesta una transacción y, con el *scheduling* del README, convierte
+> un depósito en un pago repetido desde el escrow.
+
+### 7.1 Bug 1 — excepción no capturada sobre datos del atacante
+
+`bridge/symbol/SymbolUtils.py:24` (y el gemelo NEM `bridge/nem/NemUtils.py:63`):
+
+```python
+destination_address = unhexlify(transaction_json['message']).decode('utf8')
+```
+
+El `message` es **arbitrario, lo elige quien envía**. El REST lo entrega como hex (siempre válido), pero el
+`.decode('utf8')` revienta con cualquier byte no‑UTF‑8: `FF`, `C3`, `E2 28 A1`… o directamente **una dirección
+Symbol en binario** (24 bytes). No hay `try/except` en `_download_requests` ni en `main_impl`; sólo un
+`sys.excepthook` que loguea y hace `sys.exit(1)` (`workflows/main_impl.py:38-41`).
+
+Orden exacto dentro de `_download_requests`:
+
+```
+calculate_search_range()      # checkpoint C
+database.reset()              # ← borra filas con height > C
+for tx in get_incoming_transactions_from(..., order=desc):   # ← aquí revienta
+database.set_max_processed_height(end_height - 1)            # ← nunca se ejecuta
+```
+
+Consecuencia 1 (**DoS permanente, permissionless**): el checkpoint nunca avanza; cada ejecución posterior
+re‑escanea desde C, vuelve a encontrar la tx veneno y vuelve a morir. Con el entrypoint que se publica
+(`scripts/entrypoint.sh` → `wrappedflow.sh`, `set -e`), el fallo del download aborta **también** `send_payouts`
+y las dos direcciones ⇒ el bridge queda congelado con una sola transferencia de 1 XYM. Y `nativeflow.sh`
+(swap XYM→ETH) usa el mismo downloader.
+
+### 7.2 Bug 2 — `reset()` + re‑inserción = pago repetido del mismo depósito
+
+`WrapRequestDatabase.reset()` (`bridge/db/WrapRequestDatabase.py:365`) borra **todas** las filas con
+`request_transaction_height > max_processed_height`, es decir exactamente las que se añadieron en la ventana que
+acabó de reventar — incluidas las que ya estaban **pagadas** (SENT/COMPLETED). `add_request` es un `INSERT`
+simple, así que al re‑escanear se re‑insertan como `UNPROCESSED`.
+
+Secuencia de ataque (si `download_*` y `send_payouts` corren como trabajos periódicos independientes, que es lo
+que describe el README y permite el contenedor por comando):
+
+1. atacante envía la tx veneno `P` (mensaje `FF`) a la cuenta bridge;
+2. atacante envía su depósito `D` (mensaje = su dirección) en una altura **mayor** que `P` (el escaneo es `order=desc`, así `D` se procesa antes de morir en `P`);
+3. el download añade `D` y muere en `P` ⇒ checkpoint sigue en `C`;
+4. `send_payouts` paga `D` (SENT/COMPLETED);
+5. siguiente download: `reset()` borra `D` (height > `C`), lo re‑añade como `UNPROCESSED`, vuelve a morir en `P`;
+6. `send_payouts` **vuelve a pagar `D`**… y así cada ciclo, hasta que el escrow se agote o alguien pare el proceso
+   (los límites `max_transfer_amount`/`max_daily_transfer_amount` acotan el ritmo, no el total).
+
+Coste para el atacante: el depósito `D` (que recupera en el primer pago) + dos fees. Ganancia: `D` por ciclo desde
+el escrow de terceros.
+
+### 7.3 PoC
+
+`audit/poc/bridge_crash_replay_poc.py` (código real del clon, sin modificarlo):
+
+```
+$ pip install symbol-sdk-python==3.3.3
+$ PYTHONPATH=<clone>/product/bridge python3 audit/poc/bridge_crash_replay_poc.py <clone>/product/bridge
+
+(a) downloader crash
+    control (message = ascii address)     -> 1000000 queued
+    message 0xFF               -> UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff ...  << escapes the workflow
+    message 0xC3               -> UnicodeDecodeError: ... unexpected end of data
+    message 0xE2 0x28 0xA1     -> UnicodeDecodeError: ... invalid continuation byte
+
+(b) paid marker lost across a crashed window (checkpoint 100)
+    run 1: request at height 200 marked SENT (rows with SENT status = 1)
+    reset(): rows left above checkpoint = 0 (paid row deleted)
+    re-scan: request re-inserted as UNPROCESSED = 1 -> send_payouts pays it again
+    => each cycle pays the same deposit again while the poison tx stays in the window
+```
+
+### 7.4 Remedio
+
+1. Envolver el parseo del mensaje/dirección en `try/except` y emitir un `WrapError` (nunca dejar que una tx
+   del usuario mate el workflow); idem `unhexlify` en NEM.
+2. `add_request` → `INSERT ... ON CONFLICT(hash, subindex) DO NOTHING` y **nunca** degradar una fila pagada a
+   `UNPROCESSED`; que `reset()` no toque filas con `payout_status != UNPROCESSED`.
+3. Pago idempotente por request: una única `payout_transaction_hash` persistida *antes* de anunciar, y reintentos
+   sólo si esa tx no existe en la cadena (reconciliación por hash, no por estado del nodo).
+
+---
+
+## 8. Limitaciones / lo que no se pudo cerrar
 
 1. **Bridge mainnet**: sin repo de despliegue ni contrato wrapped en la org, no se puede mapear el escrow
    mainnet (si existe). Se midió lo accesible: sólo testnet.
@@ -280,7 +376,7 @@ Contramedidas que sí funcionarían pero no están: comprobar `input_data[:4] ==
 
 ---
 
-## 8. Reproducción (comandos usados)
+## 9. Reproducción (comandos usados)
 
 ```bash
 # 0) clones
@@ -304,10 +400,14 @@ curl -s https://bridge.symbol.tools/testnet/ethereum-native/   | head -c 400
 python3 -m venv /tmp/venv && . /tmp/venv/bin/activate
 pip install symbol-sdk-python==3.3.3 web3==8.0.0
 PYTHONPATH=/home/user/audit/product/bridge python3 audit/poc/bridge_approve_poc.py /home/user/audit/product/bridge
+PYTHONPATH=/home/user/audit/product/bridge python3 audit/poc/bridge_crash_replay_poc.py /home/user/audit/product/bridge
 
 # 4) código relevante del nodo
 sed -n '25,80p' client/catapult/plugins/txes/aggregate/src/validators/AggregateTransactionsHashValidator.cpp
 sed -n '140,160p' client/catapult/plugins/txes/aggregate/src/plugins/AggregateTransactionPlugin.cpp
 sed -n '1,60p'  client/catapult/plugins/txes/lock_shared/src/observers/LockStatusAccountBalanceObserver.h
 sed -n '25,60p' client/catapult/plugins/txes/mosaic/src/validators/ActiveMosaicView.cpp
+sed -n '160,235p' client/catapult/src/catapult/model/NotificationPublisher.cpp   # fee debit last
+sed -n '45,90p'  client/catapult/src/catapult/chain/BatchEntityProcessor.cpp       # validate+observe intercalado
+sed -n '85,105p' client/catapult/src/catapult/state/AccountBalances.cpp           # debit lanza si falta saldo
 ```
