@@ -257,7 +257,7 @@ Contramedidas que sí funcionarían pero no están: comprobar `input_data[:4] ==
 | `https://bridge.symbol.tools/testnet/ethereum-native/` | **200**: `mode=swap`, bridge Symbol testnet `TBYWIC4J…`, wrapped Sepolia `0x065e308D…` |
 | `bridge.symbol.tools/ethereum-native/` | **404** |
 | `known-accounts.json` (wallet) | sólo registra **una** cuenta bridge, en `symbol.testnet` (`TBQAAMLT…`) |
-| `config.json` (wallet) "mainnet" Uniswap: `bxym=0x5e8343a4…`, `weth=0x3a8c1bd5…` | **no existen en Ethereum mainnet** (ethplorer: "Address is not a token contract"; blockscout: not found) ⇒ la config mainnet es placeholder |
+| `config.json` (wallet) "mainnet" Uniswap: `bxym=0x5e8343a4…`, `weth=0x3A8C1bd5…Ccb1`, `router=0xc50f6b8A…c349` | **no son contratos en Ethereum mainnet**: blockscout devuelve `is_contract=false`, `coin_balance=null`, `has_logs=false`, `has_token_transfers=false` para WETH y router (y el token es "not a token contract" en ethplorer) ⇒ la config mainnet es placeholder, no hay swap/stake desplegado |
 | contrato `wXYM`/`bXYM` en la org `symbol` | **no está** ⇒ escrow/token no verificable |
 
 ⇒ Hoy el único despliegue accesible es **testnet sin TVL** ⇒ por criterio no se reporta como crítico live
